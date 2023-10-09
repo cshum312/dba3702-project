@@ -1,0 +1,318 @@
+---
+title: "DBA3702 Group Project"
+author: ""
+date: ""
+output: html_document
+---
+<style>
+body {
+text-align: justify}
+</style>
+
+```{r, include=FALSE}
+library(rgdal)
+library(XML)
+library(maptools)
+library(stringr)
+library(dplyr)
+library(xml2)
+library(sf)
+library(rjson)
+library(rvest)
+library(tidyr)
+library(reshape2)
+library(ggmap)
+library(jsonlite)
+library(textutils)
+library(data.table)
+library(geoR)
+library(curl)
+library(tidyverse)
+library(RSelenium)
+library(readr)
+```
+
+App Link: https://dba3702shinyapps.shinyapps.io/BudgetSG/
+
+
+# <b>Data Preparation</b>
+
+### <b>Mapping individual locations to areas in Singapore</b>
+
+</br> OneMap.sg API documentation: https://cran.r-project.org/web/packages/onemapsgapi/onemapsgapi.pdf
+
+</br> The codes for the function can be found here:
+
+```{r eval=FALSE}
+#token for onemap api which is used to map location data into a polygon with area data
+##token will expire in 3 days need to get a new one then; can get a token through signing up here: https://developers.onemap.sg/signup/
+
+token <- 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOjgxMzUsInVzZXJfaWQiOjgxMzUsImVtYWlsIjoiZTA4NjA5MDRAdS5udXMuZWR1IiwiZm9yZXZlciI6ZmFsc2UsImlzcyI6Imh0dHA6XC9cL29tMi5kZmUub25lbWFwLnNnXC9hcGlcL3YyXC91c2VyXC9zZXNzaW9uIiwiaWF0IjoxNjM2NzA1ODIyLCJleHAiOjE2MzcxMzc4MjIsIm5iZiI6MTYzNjcwNTgyMiwianRpIjoiOTgyNDZkMjBjZDYxMWY0ODA3YWY1YTJmOTdjOTRmNTEifQ.2_KiMoA3FCXSnbVYokr7zHPv0eWOeNbLez_xX4zFKFk' 
+
+#Code to map locations to area name
+getAreaName <- function(temp){
+temp$area <- ""
+a <- 1 #reset counter to 1
+
+##Crawling function for area
+while(a<=nrow(temp)){
+  
+  if(a %% 249 == 0){
+    Sys.sleep(61) ##API has a call limit of 250 per minute: https://www.onemap.gov.sg/docs/#introduction
+    url <- paste("https://developers.onemap.sg/privateapi/popapi/getPlanningarea?token=",token,"&lat=",temp$lat[a],"&lng=",temp$lng[a],sep = "")
+    data <- fromJSON(url)
+  
+    if(is.null(data))
+        {Sys.sleep(runif(1, 0.5, 1))}
+        else{
+          temp$area[a] <- data$pln_area_n
+          }  
+    a <- a + 1   
+  }
+  else{
+    url <- paste("https://developers.onemap.sg/privateapi/popapi/getPlanningarea?token=",token,"&lat=",temp$lat[a],"&lng=",temp$lng[a],sep = "")
+    data <- fromJSON(url)
+    
+    if(is.null(data))
+        {Sys.sleep(runif(1, 0.5, 1))}
+        else{
+          temp$area[a] <- data$pln_area_n
+          }  
+  a <- a + 1   
+  }
+}  
+temp <- temp[!temp$area == "",]
+return(temp)
+}
+```
+
+### <b>Attractions Data</b>
+CSV file <b>attractions.csv</b> contains the attractions information data which we crawled from TripAdvisor.
+</br> Website: 
+</br> https://www.tripadvisor.com.sg/Attractions-g294265-Activities-zft11292-a_sort.TRAVELER5F__5F____5F__FAVORITE__5F____5F__5FV2-Singapore.html
+
+</br> The codes used to crawl the attractions data can be found here:
+
+```{r eval=FALSE}
+#Setup for ggmap api
+#register_google(key = "-", write = TRUE) #replace with own Google API key
+
+#rselenium driver
+##need to install Firefox
+rD <- RSelenium::rsDriver(browser = "firefox", extraCapabilities = list("moz:firefoxOptions" = list(args = list('--headless'))))
+remDr <- rD[["client"]]
+
+places.urls <- c()
+places.names <- c()
+pages <- c(1:15)
+domain <- "https://www.tripadvisor.com.sg"
+
+remDr$navigate("https://www.tripadvisor.com.sg/Attractions-g294262-Activities-a_allAttractions.true-zft11292-Singapore.html")
+remDr$maxWindowSize()
+
+#crawling webpage with infinite scroll using rselenium
+for (i in pages){
+  source <- remDr$getPageSource()[[1]]
+  page <- read_html(source)
+  
+  nodes.places <- html_nodes(page, ".eLWnh > header > div > div > a:nth-child(1)")
+  places.urls <- c(places.urls, paste0(domain, html_attr(nodes.places,"href")))
+  places.names <- c(places.names, html_text(nodes.places))
+  
+  nxtpage <- remDr$findElement(using = "css selector", value = ".cCnaz")
+  nxtpage$clickElement()
+  Sys.sleep(2)
+}
+
+remDr$close()
+rD$server$stop()
+system("taskkill /im java.exe /f", intern=FALSE, ignore.stdout=FALSE)
+
+places.names <- sub(".*?\\. ", "", places.names)
+
+df <- data.frame(places.names, places.urls)
+colnames(df) <- c("Name", "URL")
+
+#using ggmap to find lat and lng for individual locations
+
+for(i in 1:nrow(df))
+{
+  a <- geocode(paste0(df$Name[i],", Singapore"))
+  df$Latitude[i] <- as.numeric(a["lat"])
+  df$Longitude[i] <- as.numeric(a["lon"])
+}
+
+df2 <- df[complete.cases(df), ] %>%
+  filter(Latitude < 1.5) %>%
+  filter(!is.na(Latitude))
+
+names(df2)[names(df2) == 'Latitude'] <- 'lat'
+names(df2)[names(df2) == 'Longitude'] <- 'lng'
+
+attractions <- df2
+attractions <- getAreaName(attractions)
+head(attractions)
+```
+
+### <b>Restaurants Data</b>
+CSV file <b>restaurants.csv</b> contains the restaurant information data from which we crawled from Chope.
+</br> Website: https://www.chope.co/singapore-restaurants/list_of_restaurants?source=chope.com.sg&lang=en_US
+
+</br> The codes used to crawl the restaurant data can be found here:
+
+```{r eval=FALSE}
+chope.url <- ("https://www.chope.co/singapore-restaurants/list_of_restaurants?source=chope.com.sg&lang=en_US")
+main <- read_html(chope.url)
+
+# create a list of ind links to each restaurant info page
+list.0 <- main %>% html_nodes("#az-container li.cf a") %>% html_attr("href") %>% as.data.frame()
+list <- list.0[!grepl("shop.chope.co", list.0$.) & !(is.na(list.0$.)), ]
+chope.all <- data.frame()
+i=1
+
+while(i<length(list)) {
+    ind.url <- list[i]
+    ind.page <- tryCatch(read_html(ind.url),error = function(e){NA})  
+    
+ if(is.na(ind.page))
+    {
+      Sys.sleep(runif(1, 0.5, 1))
+      closeAllConnections()
+      i <- i+1}
+    else{
+      # name of restaurant
+      title <- ind.page %>% html_node("#title span") %>% html_text()
+      
+      # Cuisine, Menus, Hours, Price, Good.For, Location, Address
+      item <- ind.page %>% html_nodes(".type") %>% html_text()
+      value.0 <- ind.page %>% html_nodes("#rstr_info p") %>% html_text()
+      value <- str_remove_all(value.0, "\\\n[ ]+")
+      
+      # lat & lon
+      coord.0 <- ind.page %>% html_node(".mapicon") %>% html_attr("href")
+      coord <- str_extract(coord.0, "(?<=&query=)[0-9.,]+") %>% str_split(",") %>% unlist()
+      
+      # short description
+      about <- ind.page %>% html_node("#short_content0") %>% html_text()
+      
+      # recommended dishes
+      recommend <- ind.page %>% html_node("#short_content1") %>% html_text()
+      
+      # discount in %
+      discount <- ind.page %>% html_node(".text_pormotiong") %>% html_text()
+      
+      # combine info ---
+      ind.data <- c(title, value, coord[1], coord[2], about, recommend, discount,ind.url)
+      names(ind.data) <- c("Title", item, "lat", "lon", "About", "Recommend","Discount","Link")
+      
+      chope.all <- bind_rows(chope.all, ind.data)
+      
+      Sys.sleep(runif(1, 0.5, 1))
+      closeAllConnections()
+      i <- i+1}
+}
+chope.all <- chope.all[,-15]
+
+
+#data cleaning for chope.all
+chope.all$Discount <- parse_number(chope.all$Discount)
+chope.all$lon <- as.numeric(chope.all$lon)
+chope.all$lat <- as.numeric(chope.all$lat)
+chope.all <- chope.all[!(is.na(chope.all$lon) | is.na(chope.all$lat)),]
+names(chope.all)[names(chope.all) == 'lon'] <- 'lng'
+
+restaurants <- chope.all
+restaurants <- getAreaName(restaurants)
+restaurants$Title <- gsub("<.*","", restaurants$Title)
+head(restaurants)
+```
+
+### <b>Public Transport Data</b>
+CSV files <b>bus_stops.csv</b> and <b>mrt_stations.csv</b> contain the Buses and MRT location data which we crawled from  VYMaps and Data World respectively.
+</br> Bus Stop location website: https://vymaps.com/SG/Singapore/bus-line/ 
+</br> MRT location website:  https://data.world/hxchua/train-stations-in-singapore
+
+</br> The codes used to crawl the Public Transport data can be found here:
+
+```{r eval=FALSE}
+#MRT data is downloaded directly from here: https://data.world/hxchua/train-stations-in-singapore
+mrt <- read.csv("mrtsg.csv")
+names(mrt)[names(mrt) == 'Latitude'] <- 'lat'
+names(mrt)[names(mrt) == 'Longitude'] <- 'lng'
+mrt <- getAreaName(mrt)
+head(mrt)
+```
+
+```{r eval=FALSE}
+#crawl code for bus stops
+##urls for all pages
+page.url <-c("https://vymaps.com/SG/Singapore/bus-line/",
+             "https://vymaps.com/SG/Singapore/bus-line/2/",
+             "https://vymaps.com/SG/Singapore/bus-line/3/",
+             "https://vymaps.com/SG/Singapore/bus-line/4/",
+             "https://vymaps.com/SG/Singapore/bus-line/5/",
+             "https://vymaps.com/SG/Singapore/bus-line/6/",
+             "https://vymaps.com/SG/Singapore/bus-line/7/",
+             "https://vymaps.com/SG/Singapore/bus-line/8/",
+             "https://vymaps.com/SG/Singapore/bus-line/9/",
+             "https://vymaps.com/SG/Singapore/bus-line/10/",
+             "https://vymaps.com/SG/Singapore/bus-line/11/",
+             "https://vymaps.com/SG/Singapore/bus-line/12/",
+             "https://vymaps.com/SG/Singapore/bus-line/13/",
+             "https://vymaps.com/SG/Singapore/bus-line/14/",
+             "https://vymaps.com/SG/Singapore/bus-line/15/",
+             "https://vymaps.com/SG/Singapore/bus-line/16/",
+             "https://vymaps.com/SG/Singapore/bus-line/17/",
+             "https://vymaps.com/SG/Singapore/bus-line/18/",
+             "https://vymaps.com/SG/Singapore/bus-line/19/",
+             "https://vymaps.com/SG/Singapore/bus-line/20/",
+             "https://vymaps.com/SG/Singapore/bus-line/21/",
+             "https://vymaps.com/SG/Singapore/bus-line/22/",
+             "https://vymaps.com/SG/Singapore/bus-line/23/",
+             "https://vymaps.com/SG/Singapore/bus-line/24/",
+             "https://vymaps.com/SG/Singapore/bus-line/25/",
+             "https://vymaps.com/SG/Singapore/bus-line/26/",
+             "https://vymaps.com/SG/Singapore/bus-line/27/")
+
+bus <- data.frame(matrix(nrow = 0,ncol=3))
+for (i in 1:27)
+{
+  url <- page.url[i]
+  page <- read_html(url)
+  name.nodes <- html_nodes(page, ".six b a")
+  latlng.nodes <- html_nodes(page,"br+ a")
+
+  name.and.coord <- data.frame(html_text(name.nodes),html_text(latlng.nodes))
+  
+  bus<- rbind(bus, name.and.coord)
+
+}
+
+bus <- bus %>%
+  separate(html_text.latlng.nodes.,c("lat", "Lng"), sep = ", ")
+
+colnames(bus) <- c("Bus Stop", "lat", "lng")
+bus$lat <- as.numeric(bus$lat)
+bus$lng <- as.numeric(bus$lng)
+bus <- bus %>%
+  filter(lat <= 1.4 & lng <= 104 & lat >= 1.28 & lng >= 103)
+bus <- getAreaName(bus)
+head(bus)
+```
+
+### <b>Writing the crawled data into csv files</b>
+```{r eval=FALSE}
+write.csv(restaurants, "restaurants.csv")
+write.csv(attractions, "attractions.csv")
+write.csv(bus, "bus_stops.csv")
+write.csv(mrt, "mrt_stations.csv")
+```
+
+
+
+
+
+
+
+
+
